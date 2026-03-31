@@ -1,0 +1,10 @@
+langchain
+langgraph
+langchain-google-genai
+neo4j
+langchain-community
+pymatgen
+mendeleev
+pandas
+python-dotenv
+pydantic
