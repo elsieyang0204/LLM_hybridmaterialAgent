@@ -13,15 +13,15 @@
 
 ## Project Structure & Deliverables (Current State)
 1. **环境与配置**
-   - `.env` & `config.py`: 集中管理 `NEO4J`、`GOOGLE_API_KEY`、`GEMINI_MODEL` 及 `LANGSMITH` 等敏感和全局配置。
+   - `.env` & `config.py`: 集中管理 `NEO4J`、`GOOGLE_API_KEY`、`GEMINI_MODEL` 及 `LANGSMITH` 等敏感和全局配置。（注意：.env文件及所有本地保存的新材料JSON结果等会被`.gitignore`隔离，从而避免隐私和数据库密码泄露）。
    - `requirements.txt`: 核心依赖清单。
 
 2. **核心逻辑 (Agent Core)**
-   - `main_agent.py`: 实现了 LangGraph 的四节点工作流 MVP：
-     - **Planner**: 解析用户目标。
-     - **Retriever**: 从 Neo4j 获取 Top 候选材料及其属性证据。
-     - **Reasoner**: 将图谱数据作为 Payload 送入 Gemini 进行排序和推理分析。
-     - **Critic**: 检查幻觉，确保输出拥有证据支持。
+   - `main_agent.py`: 实现了基于 LangGraph 的四节点闭环强化工作流：
+     - **Planner**: 解析用户目标。**不再使用硬编码阈值**，而是动态解析用户 query 获取指定的最小 `FWHM` 和 `PLQY` 指标。
+     - **Retriever**: 根据 Planner 动态生成的指标和提取任务从 Neo4j 数据库中获取 Top 候选材料及其属性证据。
+     - **Reasoner**: 获取图谱里的已知材料作为参考基准，然后加载 `novel_candidate_prompt.txt` 作为系统提示词，强制模型跳出图谱生成全新材料（Out-of-KG），并固定返回强结构的 JSON Schema 输出。
+     - **Critic**: 解析生成的 JSON 并校验**电荷平衡 (Charge Balance)**。使用 `chem_utils.py` 自动化审查；若配平错误，会自动将报错信息（Feedback）折返 (Loopback) 回 `Reasoner` 让大语言模型基于错误进行修正。
 
 3. **工具层 (Tools)**
    - `tools/neo4j_utils.py`: 封装了兼容实际图谱 Schema（宽属性表）的 Cypher 查询函数：
@@ -38,25 +38,17 @@
 ## Agent Workflow (LangGraph Architecture)
 本项目的核心是一个基于状态图 (StateGraph) 的闭环反馈工作流，当前运行在 `main_agent.py` 中，具体运转逻辑如下：
 1. **输入与意图解析 (Planner Node)**：
-   接收用户的自然语言需求，结合 `system_p.txt` (专家角色)，提炼出单一的、可被后端明确查询的核心科学目标（例如：要求高热稳定性的宽光谱发光铜卤化物）。
+   接收用户的自然语言需求，解析出具体的客观性能阈值（如 min_fwhm, min_plqy）以及搜索目标，以 JSON 传递给 Retriever。
 2. **知识图谱检索 (Retriever Node)**：
-   调用 `neo4j_utils.py` 连接 Graph DB：
-   - 过滤出符合发光性能要求 (如 FWHM > 80, PLQY > 10%) 的 In-KG 实体现有材料。
-   - 对初筛材料查询并打包它们所有的微观性质、CIE 坐标和对应文献证据 (Evidence)。
+   动态获取从 Planner 传来的指标，调用 `neo4j_utils.py` 连接 Graph DB，过滤出符合发光性能要求的 In-KG 现有材料，收集证据数据。
 3. **推理与候选生成 (Reasoner Node)**：
-   将目标和图谱返回的客观数据作为 payload 组装给 Gemini 进行逻辑推理：
-   - **当下形态 (In-KG)**：根据用户要求对已知材料进行排序，并要求必须附带明确证据、置信度以及下一步实验建议。
-   - **未来形态 (Out-of-KG)**：利用 `novel_candidate_prompt.txt` 中定义的零次/少次样本推荐替换逻辑（如原子等价位替代、掺杂），跳出现有 KG 组合出新的材料化学式，并返回严格的 JSON 评估规范代码。
+   将目标和检索证据数据作为 payload，**强制加载 `novel_candidate_prompt.txt`** 进行严格推理约束：要求大语言模型必须生成出非已知 KG 的**全新候选材料 (Novel Candidates)**，并通过设定好的 JSON 结构输出设计意图、预期趋势等信息。
 4. **验证与纠错 (Critic Node)**：
-   充当“幻觉”和“常识”终裁者。验证上一步输出：
-   - 是否关联了足够支撑结论的 KG Evidence。
-   - （后续加入）调用 `chem_utils.py` 自动化检查新建预测材料的电荷配平规则和离子半径是否容许。
-   - 若出现幻觉或违背物理化学常识，则状态图会被路由**折返 (Loop back)**要求重试，直至符合条件后才输出给用户。
+   利用 `chem_utils.py` 自动化检测每一个预测得到的新公式是否遵循**电荷平衡法则**。如果检测到未通过化学规则的项或者非预期的 JSON 输出，Critic 节点将不再简单报错失败返回 Retriever，而是携带 `feedback` (具体的电荷错误) 路由**折返 (Loop back) 至 Reasoner Node**，让模型参考出错原因重新生成合理的化学式。成功通过测试后输出最终 JSON。
 
 ## Future Roadmap (Next Steps)
-1. **JSON 结构化与新材料生成**：将 `novel_candidate_prompt.txt` 整合进入主 Agent 的另一路分支，允许图外 (Out-of-KG) 新预测节点运行并输出结构化的 Pydantic/JSON。
-2. **严苛的化学检验**：使用 `chem_utils.py` 对新生成的 KG 外化学式进行离子半径合规与电荷中性校验。
-3. **闭环评测集 (Evaluation)**：通过 LangSmith 搭建 10-20 个 benchmark questions，基于“命中率、证据引用正确性、无幻觉率”实现自动化打分。
+1. **闭环评测集 (Evaluation)**：通过 LangSmith 搭建 10-20 个 benchmark questions，基于“命中率、证据引用正确性、无幻觉率”实现自动化打分。
+2. **多模态与进阶验证**：集成更深度的物理性质预测。
 
 ## Copilot Guidelines for This Workspace
 当你在该项目下提供协助代码时，请遵循以下准则：
