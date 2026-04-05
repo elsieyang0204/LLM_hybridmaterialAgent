@@ -1,0 +1,26 @@
+graph TD
+    %% 定义样式
+    classDef startend fill:#f9f,stroke:#333,stroke-width:2px;
+    classDef llmnode fill:#bbf,stroke:#333,stroke-width:2px;
+    classDef toolnode fill:#bfb,stroke:#333,stroke-width:2px;
+    classDef condnode fill:#fbf,stroke:#333,stroke-width:2px;
+
+    START((START)):::startend
+    END((END)):::startend
+
+    Planner[Planner Node<br/>解析用户意图, 提取 Objective]:::llmnode
+    Retriever[Retriever Node<br/>连接 Neo4j, 检索材料与证据]:::toolnode
+    Reasoner[Reasoner Node<br/>结合知识图谱数据, LLM 推理打分]:::llmnode
+    Critic[Critic Node<br/>审查草稿是否合格/是否有幻觉]:::toolnode
+    
+    Condition{Route_after_critic<br/>是否通过验证?}:::condnode
+
+    %% 连线关系
+    START --> Planner
+    Planner --> Retriever
+    Retriever --> Reasoner
+    Reasoner --> Critic
+    Critic --> Condition
+    
+    Condition -- "是 (生成 final_answer)<br/>或重试次数达标" --> END
+    Condition -- "否 (质量不佳, retry_count+1)" --> Retriever

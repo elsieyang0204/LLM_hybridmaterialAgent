@@ -146,7 +146,10 @@ def critic_node(state: AgentState) -> AgentState:
             all_valid = False
             feedback_msgs.append(f"Formula {formula} chemical parsing error: {str(e)}.")
 
-    if all_valid:
+    # Logging intercepts and failures
+    if not all_valid:
+        with open("chem_intercept_log.txt", "a", encoding="utf-8") as f:
+            f.write(f"[INTERCEPT] Retry Count: {retry_count} | Feedback: {'; '.join(feedback_msgs)}\n")
         return {"final_answer": draft}
 
     return {"retry_count": retry_count + 1, "feedback": "\n".join(feedback_msgs)}
