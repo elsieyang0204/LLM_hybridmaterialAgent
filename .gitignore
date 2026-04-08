@@ -24,7 +24,11 @@ htmlcov/
 *.swo
 
 # Project specific
+output_in_KG
 output_in_KG/
+graph TD.txt
+report_evaluation_draft.md
 
 # Generated output files
 generated_*.json
+chem_intercept_log.txt
