@@ -1,7 +1,12 @@
 import argparse
-import random
+import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if callable(reconfigure):
+        reconfigure(encoding='utf-8')
+
 from main_agent import build_graph, neo4j_tool
 
 def evaluate_first_try_pass_rate(num_runs=20, query="Recommend broadband white-light copper halide candidates"):
@@ -13,21 +18,11 @@ def evaluate_first_try_pass_rate(num_runs=20, query="Recommend broadband white-l
     
     def run_single(_):
         try:
-            # We want to trace the internal state to see if retry_count == 0
-            # LangGraph allows streaming the steps
-            first_fail = False
-            final_success = False
-            for step in app.stream({"user_query": query}):
-                for node_name, state in step.items():
-                    if node_name == "critic":
-                        retry_count = state.get("retry_count", 0)
-                        if retry_count > 0:
-                            first_fail = True
-            
-            # Reconstruct app invocation to get the final result status
             result = app.invoke({"user_query": query})
+            retry_count = int(result.get("retry_count", 0) or 0)
+            is_first_try = retry_count == 0
             final_success = bool(result.get("final_answer"))
-            return not first_fail, final_success
+            return is_first_try, final_success
         except Exception as e:
             return False, False
             
@@ -103,6 +98,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     try:
+        pass_rate = evaluate_first_try_pass_rate(num_runs=args.first_try_runs)
         consistency = evaluate_consistency(num_runs=args.consistency_runs)
         print(f"\n================ EVALUATION SUMMARY ================")
         print(f"First-Try Pass Rate = {pass_rate:.1f}%")

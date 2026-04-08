@@ -14,15 +14,15 @@ def _normalize_model_name(model_name: str) -> str:
     return name
 
 
-def build_gemini_llm(temperature: float = 0.2) -> ChatGoogleGenerativeAI:
+def build_gemini_llm(temperature: float = 0.2, model_name: str | None = None) -> ChatGoogleGenerativeAI:
     """Create a Gemini chat model using .env-backed config."""
     if not config.GOOGLE_API_KEY:
         raise ValueError("Missing GOOGLE_API_KEY in .env")
 
-    model_name = _normalize_model_name(config.GEMINI_MODEL)
+    selected_model = _normalize_model_name(model_name or config.GEMINI_MODEL)
 
     return ChatGoogleGenerativeAI(
-        model=model_name,
+        model=selected_model,
         temperature=temperature,
         google_api_key=config.GOOGLE_API_KEY,
     )
@@ -39,11 +39,7 @@ def ping_gemini(prompt: str = "Reply with only: OK") -> Any:
     last_error: Exception | None = None
     for model_name in dict.fromkeys(fallback_models):
         try:
-            llm = ChatGoogleGenerativeAI(
-                model=model_name,
-                temperature=0.0,
-                google_api_key=config.GOOGLE_API_KEY,
-            )
+            llm = build_gemini_llm(temperature=0.0, model_name=model_name)
             return llm.invoke(prompt)
         except ChatGoogleGenerativeAIError as exc:
             last_error = exc

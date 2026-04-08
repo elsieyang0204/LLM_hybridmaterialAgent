@@ -1,8 +1,15 @@
 import argparse
+import sys
 import json
-import re
+
+# 修复在Windows控制台打印带有特殊化学字符(₀₁₂₃等)时的 GBK/cp1252 编码崩溃问题
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if callable(reconfigure):
+        reconfigure(encoding='utf-8')
+
 from pathlib import Path
-from typing import Any, Dict, List, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
@@ -14,8 +21,10 @@ from tools.chem_utils import check_charge_balance, suggest_common_oxidation_stat
 class AgentState(TypedDict, total=False):
     user_query: str
     objective: str
-    min_fwhm: float
-    min_plqy: float
+    min_fwhm: Optional[float]
+    min_plqy: Optional[float]
+    constraint_source: str
+    constraint_policy: Dict[str, Any]
     candidates: List[Dict[str, Any]]
     evidence: Dict[str, List[Dict[str, Any]]]
     draft_answer: str
@@ -25,11 +34,85 @@ class AgentState(TypedDict, total=False):
     retry_count: int
 
 
-def _load_system_prompt(filename: str) -> str:
-    path = Path("prompts") / filename
+def _llm_content_to_text(content: Any) -> str:
+    """Normalize LangChain model outputs into a plain string for robust parsing."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                parts.append(json.dumps(item, ensure_ascii=False))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    return str(content)
+
+
+def _load_system_prompt(filename: str, required: bool = False) -> str:
+    path = Path(config.BASE_DIR) / "prompts" / filename
     if not path.exists():
+        if required:
+            raise FileNotFoundError(f"Required prompt file not found: {path}")
         return ""
-    return path.read_text(encoding="utf-8").strip()
+
+    prompt = path.read_text(encoding="utf-8").strip()
+    if required and not prompt:
+        raise ValueError(f"Required prompt file is empty: {path}")
+    return prompt
+
+
+def _to_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    """Extract the first balanced JSON object from free-form model output."""
+    if not text:
+        return None
+
+    start = -1
+    depth = 0
+    in_string = False
+    escape = False
+
+    for idx, ch in enumerate(text):
+        if start == -1:
+            if ch == "{":
+                start = idx
+                depth = 1
+            continue
+
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : idx + 1]
+
+    return None
 
 
 def planner_node(state: AgentState) -> AgentState:
@@ -37,24 +120,25 @@ def planner_node(state: AgentState) -> AgentState:
     user_query = state.get("user_query", "Recommend copper halide candidates for broadband white light")
 
     prompt = (
-        "Analyze the user query and extract the required performance metrics along with a short objective. "
-        "FWHM defaults to 80 and PLQY defaults to 10 if not explicitly mentioned.\n"
-        "Output ONLY valid JSON like: {\"objective\": \"...\", \"min_fwhm\": 80, \"min_plqy\": 10}\n"
+        "Analyze the user query and extract requested performance constraints along with a short objective.\n"
+        "If a metric is not explicitly requested, output null for that metric.\n"
+        "Output ONLY valid JSON like: {\"objective\": \"...\", \"min_fwhm\": null, \"min_plqy\": null}\n"
         f"User query: {user_query}"
     )
-    res = llm.invoke(prompt).content
+    response = llm.invoke(prompt)
+    res = _llm_content_to_text(getattr(response, "content", response))
     
     objective = user_query
-    min_fwhm = 80.0
-    min_plqy = 10.0
+    min_fwhm = None
+    min_plqy = None
     
     try:
-        json_match = re.search(r'\{.*\}', res, re.DOTALL)
-        if json_match:
-            data = json.loads(json_match.group(0))
+        json_obj = _extract_first_json_object(res)
+        if json_obj:
+            data = json.loads(json_obj)
             objective = data.get("objective", user_query)
-            min_fwhm = float(data.get("min_fwhm", 80.0))
-            min_plqy = float(data.get("min_plqy", 10.0))
+            min_fwhm = _to_optional_float(data.get("min_fwhm"))
+            min_plqy = _to_optional_float(data.get("min_plqy"))
     except Exception:
         pass
 
@@ -62,13 +146,56 @@ def planner_node(state: AgentState) -> AgentState:
         "objective": str(objective).strip(),
         "min_fwhm": min_fwhm,
         "min_plqy": min_plqy,
+        "constraint_source": "user" if (min_fwhm is not None or min_plqy is not None) else "pending",
         "retry_count": state.get("retry_count", 0)
     }
 
 
+def constraint_builder_node(state: AgentState) -> AgentState:
+    objective = state.get("objective", "")
+    user_fwhm_opt = state.get("min_fwhm")
+    user_plqy_opt = state.get("min_plqy")
+
+    if not config.DYNAMIC_CONSTRAINTS:
+        final_fwhm = user_fwhm_opt if user_fwhm_opt is not None else 80.0
+        final_plqy = user_plqy_opt if user_plqy_opt is not None else 10.0
+        source = "user" if (user_fwhm_opt is not None or user_plqy_opt is not None) else "fallback"
+        return {
+            "min_fwhm": float(final_fwhm),
+            "min_plqy": float(final_plqy),
+            "constraint_source": source,
+            "constraint_policy": {
+                "dynamic_constraints": False,
+                "fallback_defaults": {"min_fwhm": 80.0, "min_plqy": 10.0},
+            },
+        }
+
+    suggestion = neo4j_tool.suggest_white_light_constraints(
+        objective=objective,
+        user_min_fwhm=user_fwhm_opt,
+        user_min_plqy=user_plqy_opt,
+        fallback_min_fwhm=80.0,
+        fallback_min_plqy=10.0,
+    )
+
+    return {
+        "min_fwhm": suggestion["min_fwhm"],
+        "min_plqy": suggestion["min_plqy"],
+        "constraint_source": suggestion.get("source", "kg"),
+        "constraint_policy": {
+            "dynamic_constraints": True,
+            "policy": suggestion.get("policy", {}),
+        },
+    }
+
+
 def retriever_node(state: AgentState) -> AgentState:
-    min_fwhm = state.get("min_fwhm", 80.0)
-    min_plqy = state.get("min_plqy", 10.0)
+    min_fwhm = state.get("min_fwhm")
+    min_plqy = state.get("min_plqy")
+    if min_fwhm is None:
+        min_fwhm = 80.0
+    if min_plqy is None:
+        min_plqy = 10.0
     candidates = neo4j_tool.find_white_light_candidates(limit=5, min_fwhm=min_fwhm, min_plqy=min_plqy)
     evidence: Dict[str, List[Dict[str, Any]]] = {}
 
@@ -84,7 +211,7 @@ def retriever_node(state: AgentState) -> AgentState:
 
 def reasoner_node(state: AgentState) -> AgentState:
     llm = build_gemini_llm(temperature=0.2)
-    system_prompt = _load_system_prompt("novel_candidate_prompt.txt")
+    system_prompt = _load_system_prompt("novel_candidate_prompt.txt", required=True)
 
     payload = {
         "objective": state.get("objective"),
@@ -99,12 +226,13 @@ def reasoner_node(state: AgentState) -> AgentState:
         f"Payload:\n{json.dumps(payload, ensure_ascii=False)}"
     )
 
-    draft = llm.invoke(prompt).content
+    response = llm.invoke(prompt)
+    draft = _llm_content_to_text(getattr(response, "content", response))
     novel_cands = []
     try:
-        json_match = re.search(r'\{.*\}', draft, re.DOTALL)
-        if json_match:
-            parsed = json.loads(json_match.group(0))
+        json_obj = _extract_first_json_object(draft)
+        if json_obj:
+            parsed = json.loads(json_obj)
             novel_cands = parsed.get("novel_candidates", [])
     except Exception:
         pass
@@ -128,31 +256,43 @@ def critic_node(state: AgentState) -> AgentState:
         if not formula:
             continue
         try:
+            import re
+            # Pre-process formula to prevent pymatgen parsing errors
+            # 1. Convert unicode subscripts/superscripts to standard ASCII
+            clean_f = formula.translate(str.maketrans("₀₁₂₃₄₅₆₇₈₉⁺⁻", "0123456789+-"))
+            # 2. Strip out dopant declarations like " (0.2% In)", ":Ag", " (x% Tl)"
+            # 修改正则：仅截断处于空格后的圆括号（如掺杂说明）或冒号后的掺杂，而不误杀开头的合法配合物圆括号
+            clean_f = re.sub(r'(?:\s+\(.*|:.*)$', '', clean_f)
+            # 再清理掉可能残留的空格
+            clean_f = clean_f.replace(' ', '')
+
             # Simplistic assignment of common oxidation states to test validity
-            suggestions = suggest_common_oxidation_states(formula)
+            suggestions = suggest_common_oxidation_states(clean_f)
             # Prioritize standard oxidation states for common elements in this domain: Cu(+1), Halides(-1), Alkali(+1)
             ox_states = {}
             for el, states in suggestions.items():
-                if el == "Cu" and 1 in states: ox_states[el] = 1
+                # 强制铜基卤化物发光材料中的 Cu 以 +1 价计算电荷平衡
+                if el == "Cu": ox_states[el] = 1
                 elif el in ["I", "Br", "Cl", "F"] and -1 in states: ox_states[el] = -1
                 elif states: ox_states[el] = states[0]
                 else: ox_states[el] = 0
 
-            res = check_charge_balance(formula, ox_states)
+            res = check_charge_balance(clean_f, ox_states)
             if not res["is_balanced"]:
                 all_valid = False
-                feedback_msgs.append(f"Formula {formula} fails charge balance. Calculated total charge: {res['total_charge']}.")
+                feedback_msgs.append(f"Formula {clean_f} (from {formula}) fails charge balance. Calculated total charge: {res['total_charge']}.")
         except Exception as e:
             all_valid = False
-            feedback_msgs.append(f"Formula {formula} chemical parsing error: {str(e)}.")
+            feedback_msgs.append(f"Formula {formula} validation error: {str(e)}")
 
-    # Logging intercepts and failures
     if not all_valid:
         with open("chem_intercept_log.txt", "a", encoding="utf-8") as f:
             f.write(f"[INTERCEPT] Retry Count: {retry_count} | Feedback: {'; '.join(feedback_msgs)}\n")
-        return {"final_answer": draft}
+        # 验证失败，返回反馈信息和重试次数，触发重试循环
+        return {"retry_count": retry_count + 1, "feedback": "\n".join(feedback_msgs)}
 
-    return {"retry_count": retry_count + 1, "feedback": "\n".join(feedback_msgs)}
+    # 验证全部通过，输出最终答案并结束
+    return {"final_answer": draft}
 
 
 def route_after_critic(state: AgentState) -> str:
@@ -166,12 +306,14 @@ def route_after_critic(state: AgentState) -> str:
 def build_graph():
     graph = StateGraph(AgentState)
     graph.add_node("planner", planner_node)
+    graph.add_node("constraint_builder", constraint_builder_node)
     graph.add_node("retriever", retriever_node)
     graph.add_node("reasoner", reasoner_node)
     graph.add_node("critic", critic_node)
 
     graph.add_edge(START, "planner")
-    graph.add_edge("planner", "retriever")
+    graph.add_edge("planner", "constraint_builder")
+    graph.add_edge("constraint_builder", "retriever")
     graph.add_edge("retriever", "reasoner")
     graph.add_edge("reasoner", "critic")
     graph.add_conditional_edges("critic", route_after_critic, {"reasoner": "reasoner", END: END})
@@ -187,12 +329,12 @@ def run_agent(user_query: str) -> str:
 
 def save_output_to_json(output_str: str, filepath: str = "generated_candidates.json") -> None:
     try:
-        json_match = re.search(r'\{.*\}', output_str, re.DOTALL)
-        if not json_match:
+        json_obj = _extract_first_json_object(output_str)
+        if not json_obj:
             print("\n[-] No valid JSON found in the output to save.")
             return
         
-        new_data = json.loads(json_match.group(0))
+        new_data = json.loads(json_obj)
         p = Path(filepath)
         
         existing_data = []

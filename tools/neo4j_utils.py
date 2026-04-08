@@ -1,6 +1,6 @@
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from neo4j import GraphDatabase
 
@@ -57,6 +57,114 @@ class Neo4jTool:
             return float(number) if number else None
         except ValueError:
             return None
+
+    @staticmethod
+    def _percentile(values: List[float], q: float) -> Optional[float]:
+        """Compute percentile with linear interpolation. q should be in [0, 1]."""
+        if not values:
+            return None
+        if len(values) == 1:
+            return float(values[0])
+
+        ordered = sorted(values)
+        q = max(0.0, min(1.0, q))
+        pos = q * (len(ordered) - 1)
+        lower = int(pos)
+        upper = min(lower + 1, len(ordered) - 1)
+        if lower == upper:
+            return float(ordered[lower])
+        weight = pos - lower
+        return float(ordered[lower] * (1.0 - weight) + ordered[upper] * weight)
+
+    def get_white_light_property_distribution(self) -> Dict[str, Any]:
+        """Collect numeric FWHM/PLQY distributions from KG property nodes."""
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH (m:Material)
+                OPTIONAL MATCH (m)-[r]->(p)
+                WHERE type(r) IN $property_rel_types
+                WITH m, collect(DISTINCT p) as props
+                RETURN m.formula as formula,
+                       [x IN props WHERE x.fwhm IS NOT NULL | x.fwhm] as fwhm_values,
+                       [x IN props WHERE x.PLQY IS NOT NULL | x.PLQY] as plqy_values,
+                       [x IN props WHERE x.stability IS NOT NULL | x.stability] as stability_values
+                """,
+                property_rel_types=self.property_rel_types,
+            )
+
+            fwhm_all: List[float] = []
+            plqy_all: List[float] = []
+            stability_count = 0
+
+            for record in result:
+                fwhm_values = record.get("fwhm_values") or []
+                plqy_values = record.get("plqy_values") or []
+                stability_values = record.get("stability_values") or []
+
+                parsed_fwhm = [self._extract_numeric(v) for v in fwhm_values]
+                parsed_plqy = [self._extract_numeric(v) for v in plqy_values]
+                fwhm_all.extend([v for v in parsed_fwhm if v is not None])
+                plqy_all.extend([v for v in parsed_plqy if v is not None])
+                if stability_values:
+                    stability_count += 1
+
+            return {
+                "fwhm": fwhm_all,
+                "plqy": plqy_all,
+                "materials_with_stability": stability_count,
+            }
+
+    def suggest_white_light_constraints(
+        self,
+        objective: str,
+        user_min_fwhm: Optional[float],
+        user_min_plqy: Optional[float],
+        fallback_min_fwhm: float = 80.0,
+        fallback_min_plqy: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Suggest retrieval constraints using user intent + KG percentiles."""
+        dist = self.get_white_light_property_distribution()
+        fwhm_values = dist.get("fwhm", [])
+        plqy_values = dist.get("plqy", [])
+        objective_l = (objective or "").lower()
+
+        # Intent-sensitive percentile policy.
+        fwhm_q = 0.70 if any(k in objective_l for k in ["broad", "宽", "white", "白光"]) else 0.60
+        plqy_q = 0.80 if any(k in objective_l for k in ["high", "efficient", "高", "效率", "yield"]) else 0.70
+
+        suggested_fwhm = self._percentile(fwhm_values, fwhm_q)
+        suggested_plqy = self._percentile(plqy_values, plqy_q)
+
+        min_fwhm = user_min_fwhm
+        min_plqy = user_min_plqy
+        source = "user"
+
+        if min_fwhm is None:
+            min_fwhm = suggested_fwhm if suggested_fwhm is not None else fallback_min_fwhm
+            source = "kg" if suggested_fwhm is not None else "fallback"
+        if min_plqy is None:
+            min_plqy = suggested_plqy if suggested_plqy is not None else fallback_min_plqy
+            source = "kg" if source in {"kg", "fallback"} and suggested_plqy is not None else source
+            if source == "user" and user_min_fwhm is not None and user_min_plqy is None:
+                source = "hybrid"
+        if user_min_fwhm is None and user_min_plqy is None and source == "user":
+            source = "fallback"
+        elif (user_min_fwhm is None) != (user_min_plqy is None):
+            if source != "fallback":
+                source = "hybrid"
+
+        return {
+            "min_fwhm": float(min_fwhm),
+            "min_plqy": float(min_plqy),
+            "source": source,
+            "policy": {
+                "fwhm_percentile": fwhm_q,
+                "plqy_percentile": plqy_q,
+                "fwhm_samples": len(fwhm_values),
+                "plqy_samples": len(plqy_values),
+            },
+        }
 
     def query_material_props(self, formula):
         """查询特定材料的所有性质（向后兼容旧接口）。"""

@@ -1,0 +1,21 @@
+[project]
+name = "copper-halide-ai-agent"
+version = "0.1.0"
+description = "LangGraph + Neo4j agent for copper halide white-light candidate retrieval and out-of-KG generation"
+readme = "report_evaluation_draft.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "langchain",
+  "langgraph",
+  "langchain-google-genai",
+  "neo4j",
+  "langchain-community",
+  "pymatgen",
+  "mendeleev",
+  "pandas",
+  "python-dotenv",
+  "pydantic",
+]
+
+[tool.uv]
+package = false
